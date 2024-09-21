@@ -1,0 +1,113 @@
+# Use Red Hat Universal Base Image 8 with Node.js 20 instead of Node.js 20 Alpine
+FROM registry.access.redhat.com/ubi8/ubi:8.8 AS base
+
+# Set environment variables for Node.js installation
+ENV NODE_VERSION=20.x
+ENV NPM_CONFIG_LOGLEVEL=warn
+
+# Install necessary utilities, Node.js dependencies, and curl to fetch Node.js
+RUN dnf install -y \
+    curl \
+    gcc-c++ \
+    make \
+    openssl \
+    libtool \
+    glibc \
+    && dnf clean all
+
+# Install Node.js 20 from Nodesource
+RUN curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+
+# Install Node.js and npm
+RUN dnf install -y nodejs && \
+    dnf clean all
+
+# Install Turbo globally using npm
+RUN npm install turbo@^1.13.4 --global
+RUN npm i corepack --global
+
+# Set up pnpm using Corepack (bundled with Node.js)
+ENV PNPM_HOME="/pnpm"
+ENV PATH="$PNPM_HOME:$PATH"
+
+RUN corepack enable
+RUN corepack prepare pnpm@9.5.0 --activate
+
+# Pruner stage to isolate the project workspace using Turbo
+FROM base AS pruner
+
+WORKDIR /app
+
+# Copy all the source files
+COPY . .
+
+# Prune the workspace to optimize for Docker builds
+RUN turbo prune --scope=worker --docker
+
+# Builder stage to compile the application
+FROM base AS builder
+
+WORKDIR /app
+
+# Copy dependency files for installation
+COPY --from=pruner /app/out/pnpm-lock.yaml ./pnpm-lock.yaml
+COPY --from=pruner /app/out/pnpm-workspace.yaml ./pnpm-workspace.yaml
+COPY --from=pruner /app/out/json/ .
+
+# Install dependencies using pnpm
+RUN pnpm install --frozen-lockfile
+
+# Pass public build arguments
+ARG NEXT_PUBLIC_LANGFUSE_CLOUD_REGION
+ARG NEXT_PUBLIC_DEMO_ORG_ID
+ARG NEXT_PUBLIC_DEMO_PROJECT_ID
+ARG NEXT_PUBLIC_POSTHOG_KEY
+ARG NEXT_PUBLIC_POSTHOG_HOST
+
+# Copy the source code of isolated subworkspace from pruner
+COPY --from=pruner /app/out/full/ .
+
+# Build the project using Turbo
+RUN turbo run build --filter=worker...
+
+# Runner stage for the final production container
+FROM base AS runner
+
+# Install dumb-init manually from GitHub releases
+RUN curl -Lo /usr/local/bin/dumb-init https://github.com/Yelp/dumb-init/releases/download/v1.2.5/dumb-init_1.2.5_x86_64 && \
+    chmod +x /usr/local/bin/dumb-init
+
+ENV PATH="/usr/local/bin:$PATH"
+RUN /usr/local/bin/dumb-init --version
+
+# Use dumb-init to handle PID 1 in container and install it in the previous stage
+#RUN dnf install -y dumb-init && dnf clean all
+
+WORKDIR /app
+
+# Set environment variables for production
+ENV NODE_ENV production
+ENV DOCKER_BUILD 0
+
+# Create non-root user for security reasons
+RUN groupadd -r expressjs && useradd -r -g expressjs expressjs
+
+# Copy built application files from the builder stage
+COPY --from=builder --chown=expressjs:expressjs /app .
+
+# Copy the entrypoint script
+COPY --chown=expressjs:expressjs ./worker/entrypoint.sh ./worker/entrypoint.sh
+RUN chmod +x ./worker/entrypoint.sh
+
+# Set the user to the non-root user
+USER expressjs
+
+# Expose the application port
+EXPOSE 3030
+ENV PORT=3030
+
+# Use dumb-init as the entry point
+ENTRYPOINT ["dumb-init", "--", "./worker/entrypoint.sh"]
+
+# Command to start the application
+CMD ["node", "worker/dist/index.js"]

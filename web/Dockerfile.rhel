@@ -1,0 +1,153 @@
+# Use Red Hat UBI (Universal Base Image) with Node.js 20 instead of Node 20 Alpine
+FROM registry.access.redhat.com/ubi8/ubi:8.8 AS base
+
+# Set environment variables for Node.js installation
+ENV NODE_VERSION=20.x
+ENV NPM_CONFIG_LOGLEVEL=warn
+
+# Install necessary utilities, Node.js dependencies, and curl to fetch Node.js
+RUN dnf install -y \
+    curl \
+    gcc-c++ \
+    make \
+    openssl \
+    libtool \
+    glibc \
+    && dnf clean all
+
+# Install Node.js 20 from Nodesource
+RUN curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+
+# Install Node.js and npm
+RUN dnf install -y nodejs && \
+    dnf clean all
+
+# Install Turbo globally using npm
+RUN npm install turbo@^1.13.4 --global
+RUN npm i corepack --global
+
+# Set up pnpm using Corepack (bundled with Node.js)
+ENV PNPM_HOME="/pnpm"
+ENV PATH="$PNPM_HOME:$PATH"
+
+RUN corepack enable
+RUN corepack prepare pnpm@9.5.0 --activate
+
+# Create a pruner stage for Turbo repo pruning
+FROM base AS pruner
+
+WORKDIR /app
+
+COPY . .
+RUN turbo prune --scope=web --docker
+
+# Build stage
+FROM base AS builder
+
+WORKDIR /app
+
+# Install dependencies
+COPY --from=pruner /app/out/pnpm-lock.yaml ./pnpm-lock.yaml
+COPY --from=pruner /app/out/pnpm-workspace.yaml ./pnpm-workspace.yaml
+COPY --from=pruner /app/out/json/ .
+
+RUN pnpm install --frozen-lockfile
+
+# Set environment variables for the build process
+ENV DOCKER_BUILD 1
+ENV NEXT_MANUAL_SIG_HANDLE true
+
+# Pass public variables in build step
+ARG NEXT_PUBLIC_CRISP_WEBSITE_ID
+ARG NEXT_PUBLIC_LANGFUSE_CLOUD_REGION
+ENV NEXT_PUBLIC_LANGFUSE_CLOUD_REGION=$NEXT_PUBLIC_LANGFUSE_CLOUD_REGION
+ARG NEXT_PUBLIC_DEMO_ORG_ID
+ENV NEXT_PUBLIC_DEMO_ORG_ID=$NEXT_PUBLIC_DEMO_ORG_ID
+ARG NEXT_PUBLIC_DEMO_PROJECT_ID
+ENV NEXT_PUBLIC_DEMO_PROJECT_ID=$NEXT_PUBLIC_DEMO_PROJECT_ID
+ARG NEXT_PUBLIC_SIGN_UP_DISABLED
+ENV NEXT_PUBLIC_SIGN_UP_DISABLED=$NEXT_PUBLIC_SIGN_UP_DISABLED
+ARG NEXT_PUBLIC_TURNSTILE_SITE_KEY
+ENV NEXT_PUBLIC_TURNSTILE_SITE_KEY=$NEXT_PUBLIC_TURNSTILE_SITE_KEY
+ARG NEXT_PUBLIC_POSTHOG_KEY
+ENV NEXT_PUBLIC_POSTHOG_KEY=$NEXT_PUBLIC_POSTHOG_KEY
+ARG NEXT_PUBLIC_POSTHOG_HOST
+ENV NEXT_PUBLIC_POSTHOG_HOST=$NEXT_PUBLIC_POSTHOG_HOST
+ARG NEXT_PUBLIC_LANGFUSE_TRACING_SAMPLE_RATE
+ENV NEXT_PUBLIC_LANGFUSE_TRACING_SAMPLE_RATE=$NEXT_PUBLIC_LANGFUSE_TRACING_SAMPLE_RATE
+ARG NEXT_PUBLIC_SENTRY_ENVIRONMENT
+ENV NEXT_PUBLIC_SENTRY_ENVIRONMENT=$NEXT_PUBLIC_SENTRY_ENVIRONMENT
+ARG NEXT_PUBLIC_SENTRY_DSN
+ENV NEXT_PUBLIC_SENTRY_DSN=$NEXT_PUBLIC_SENTRY_DSN
+ARG NEXT_PUBLIC_BASE_PATH
+ENV NEXT_PUBLIC_BASE_PATH=$NEXT_PUBLIC_BASE_PATH
+
+# Accept build id as NEXT_PUBLIC_BUILD_ID or PORTER_NEXT_PUBLIC_BUILD_ID
+ARG PORTER_NEXT_PUBLIC_BUILD_ID
+ARG NEXT_PUBLIC_BUILD_ID
+ENV NEXT_PUBLIC_BUILD_ID=${PORTER_NEXT_PUBLIC_BUILD_ID:-$NEXT_PUBLIC_BUILD_ID}
+
+# Copy source code of isolated subworkspace
+COPY --from=pruner /app/out/full/ .
+
+# Remove unnecessary middleware.ts file
+RUN rm -f ./web/src/middleware.ts
+
+# Disable telemetry
+ENV NEXT_TELEMETRY_DISABLED 1
+ENV NEXT_MANUAL_SIG_HANDLE true
+
+# Build project with Turbo
+RUN NODE_OPTIONS='--max-old-space-size=4096' turbo run build --filter=web
+
+# Production image, setting up the final image
+FROM base AS runner
+
+# Install dumb-init manually from GitHub releases
+RUN curl -Lo /usr/local/bin/dumb-init https://github.com/Yelp/dumb-init/releases/download/v1.2.5/dumb-init_1.2.5_x86_64 && \
+    chmod +x /usr/local/bin/dumb-init
+
+
+ENV PATH="/usr/local/bin:$PATH"
+RUN /usr/local/bin/dumb-init --version
+
+WORKDIR /app
+
+ENV NODE_ENV production
+ENV NEXT_TELEMETRY_DISABLED 1
+ENV DOCKER_BUILD 0
+ENV NEXT_MANUAL_SIG_HANDLE true
+
+
+# Create user for next.js app
+RUN groupadd -r nodejs && useradd -r -g nodejs nextjs
+
+# Install Prisma globally
+RUN npm install -g --no-package-lock --no-save prisma@5.13.0
+
+# Copy build output and required files from builder stage
+COPY --from=builder --chown=nextjs:nodejs /app/web/next.config.mjs .
+COPY --from=builder --chown=nextjs:nodejs /app/web/package.json .
+COPY --from=builder --chown=nextjs:nodejs /app/web/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/web/.next/static ./web/.next/static
+COPY --from=builder --chown=nextjs:nodejs /app/web/public ./web/public
+
+# Copy prisma files
+COPY --from=builder --chown=nextjs:nodejs /app/packages/shared/prisma ./packages/shared/prisma
+
+# Copy entrypoint and scripts
+COPY --chown=nextjs:nodejs ./web/entrypoint.sh ./web/entrypoint.sh
+COPY --chown=nextjs:nodejs ./packages/shared/scripts/cleanup.sql ./packages/shared/scripts/cleanup.sql
+RUN chmod +x ./web/entrypoint.sh
+
+# Use the nextjs user
+USER nextjs
+
+# Set default port
+ENV PORT 3000
+
+# Set entrypoint to use dumb-init
+ENTRYPOINT ["dumb-init", "--", "./web/entrypoint.sh"]
+
+# Command to start the application
+CMD ["node", "./web/server.js", "--keepAliveTimeout", "110000"]
